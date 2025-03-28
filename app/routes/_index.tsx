@@ -1,25 +1,37 @@
 import { useState } from 'react';
-import { Form, Link, useFetcher } from '@remix-run/react';
-import type { ActionFunctionArgs, MetaFunction } from '@remix-run/node';
+import { Form, Link, useFetcher, useLoaderData } from '@remix-run/react';
+import type { ActionFunctionArgs, LoaderFunctionArgs, MetaFunction } from '@remix-run/node';
 import { json, redirect } from '@remix-run/node';
-import { nanoid } from 'nanoid'; // For generating unique game IDs
-import { supabase } from '~/lib/supabase'; // Import the Supabase client
+import { nanoid } from 'nanoid';
+import { supabase } from '~/lib/supabase';
+import { getUser, requireAdmin, requirePlayer } from '~/lib/session.server'; // Import auth helpers
 
 export const meta: MetaFunction = () => {
   return [{ title: 'Live Quiz Game' }];
 };
 
-// Action to create a new game and save it to the database
-export async function action({ request }: ActionFunctionArgs) {
-  const gamePin = nanoid(6).toUpperCase(); // Generate a 6-character uppercase game PIN
-  console.log(`Creating game with PIN: ${gamePin}`);
+// Loader to get user data
+export async function loader({ request }: LoaderFunctionArgs) {
+  const user = await getUser(request); // Get user session, null if not logged in
+  return json({ user });
+}
 
-  // Save the new game to the Supabase 'games' table
+
+// Action to create a new game (only for admins)
+export async function action({ request }: ActionFunctionArgs) {
+  const adminUser = await requireAdmin(request); // Ensures user is logged in and is an admin
+
+  const gamePin = nanoid(6).toUpperCase();
+  console.log(`Admin ${adminUser.email} creating game with PIN: ${gamePin}`);
+
   const { data, error } = await supabase
     .from('games')
-    .insert([{ game_pin: gamePin }]) // Insert the game_pin, host_id will be null initially
-    .select() // Optionally select the inserted data if needed
-    .single(); // Expecting a single row back
+    .insert([{
+        game_pin: gamePin,
+        host_id: adminUser.id // Set the host_id to the admin's user ID
+    }])
+    .select()
+    .single();
 
   if (error) {
     console.error('Error creating game in Supabase:', error);
@@ -28,74 +40,95 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   console.log('Game created successfully in Supabase:', data);
-
-  // Redirect the user to the host page for the newly created game
   return redirect(`/host/${gamePin}`);
 }
 
 export default function Index() {
+  const { user } = useLoaderData<typeof loader>();
   const [joinGameId, setJoinGameId] = useState('');
-  const createGameFetcher = useFetcher<typeof action>(); // Add type for fetcher data/errors
+  const createGameFetcher = useFetcher<typeof action>();
 
   const isCreatingGame = createGameFetcher.state !== 'idle';
+  const isAdmin = user?.user_metadata?.is_admin === true;
+  const isPlayer = user && !isAdmin;
 
   return (
-    <div className="flex h-screen flex-col items-center justify-center gap-12 p-8 font-sans dark:bg-gray-900">
+    <div className="flex flex-col items-center justify-center gap-12 p-8">
       <h1 className="text-4xl font-bold text-gray-800 dark:text-gray-100">
         Live Quiz Game
       </h1>
 
-      <div className="flex w-full max-w-md flex-col gap-6">
-        {/* Create Game */}
-        <createGameFetcher.Form method="post">
-          <button
-            type="submit"
-            disabled={isCreatingGame}
-            className="w-full rounded-lg bg-blue-600 px-6 py-3 text-lg font-semibold text-white shadow transition-colors duration-150 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {isCreatingGame ? 'Creating...' : 'Create New Game'}
-          </button>
-          {/* Display error message if game creation failed */}
-          {createGameFetcher.data?.error && ( // THIS LINE IS CORRECTED
-            <p className="mt-2 text-center text-sm text-red-600 dark:text-red-400">
-              Error: {createGameFetcher.data.error}
-            </p>
-          )}
-        </createGameFetcher.Form>
+      {!user && (
+        <div className="text-center p-6 border border-gray-200 dark:border-gray-700 rounded-lg">
+          <p className="mb-4 text-lg text-gray-700 dark:text-gray-200">Welcome! Please log in or sign up to play.</p>
+          <div className="flex justify-center gap-4">
+            <Link to="/login" className="rounded-lg bg-blue-600 px-6 py-2 text-white hover:bg-blue-700">
+              Login
+            </Link>
+            <Link to="/signup" className="rounded-lg bg-green-600 px-6 py-2 text-white hover:bg-green-700">
+              Sign Up
+            </Link>
+          </div>
+        </div>
+      )}
 
-        {/* Join Game */}
-        <Form
-          method="get" // Use GET to navigate to the join page with query param
-          action="/play"
-          className="flex flex-col gap-4 rounded-lg border border-gray-200 p-6 dark:border-gray-700"
-        >
-          <label
-            htmlFor="gameId"
-            className="text-lg font-semibold text-gray-700 dark:text-gray-200"
-          >
-            Join Existing Game
-          </label>
-          <input
-            type="text"
-            id="gameId"
-            name="gameId" // Name matches the query param expected on /play
-            value={joinGameId}
-            onChange={(e) => setJoinGameId(e.target.value.toUpperCase())}
-            placeholder="Enter Game PIN"
-            maxLength={6}
-            className="rounded border border-gray-300 px-4 py-2 text-center text-lg uppercase tracking-widest focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-            required
-            autoCapitalize="characters"
-            autoComplete="off"
-          />
-          <button
-            type="submit"
-            className="rounded-lg bg-green-600 px-6 py-3 text-lg font-semibold text-white shadow transition-colors duration-150 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
-          >
-            Join Game
-          </button>
-        </Form>
-      </div>
+      {user && (
+        <div className="flex w-full max-w-md flex-col gap-6">
+          {/* Create Game (Admin Only) */}
+          {isAdmin && (
+            <createGameFetcher.Form method="post">
+              <button
+                type="submit"
+                disabled={isCreatingGame}
+                className="w-full rounded-lg bg-blue-600 px-6 py-3 text-lg font-semibold text-white shadow transition-colors duration-150 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {isCreatingGame ? 'Creating...' : 'Create New Game (Admin)'}
+              </button>
+              {createGameFetcher.data?.error && (
+                <p className="mt-2 text-center text-sm text-red-600 dark:text-red-400">
+                  Error: {createGameFetcher.data.error}
+                </p>
+              )}
+            </createGameFetcher.Form>
+          )}
+
+          {/* Join Game (Player Only) */}
+          {isPlayer && (
+            <Form
+              method="get" // Navigate to /play?gameId=XYZ
+              action="/play"
+              className="flex flex-col gap-4 rounded-lg border border-gray-200 p-6 dark:border-gray-700"
+            >
+              <label
+                htmlFor="gameId"
+                className="text-lg font-semibold text-gray-700 dark:text-gray-200"
+              >
+                Join Existing Game (Player)
+              </label>
+              <input
+                type="text"
+                id="gameId"
+                name="gameId" // This becomes the query parameter
+                value={joinGameId}
+                onChange={(e) => setJoinGameId(e.target.value.toUpperCase())}
+                placeholder="Enter Game PIN"
+                maxLength={6}
+                className="rounded border border-gray-300 px-4 py-2 text-center text-lg uppercase tracking-widest focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+                required
+                autoCapitalize="characters"
+                autoComplete="off"
+              />
+              <button
+                type="submit"
+                className="rounded-lg bg-green-600 px-6 py-3 text-lg font-semibold text-white shadow transition-colors duration-150 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
+              >
+                Join Game
+              </button>
+              {/* TODO: Add error display if joining fails (e.g., invalid PIN) - handled on /play page */}
+            </Form>
+          )}
+        </div>
+      )}
     </div>
   );
 }

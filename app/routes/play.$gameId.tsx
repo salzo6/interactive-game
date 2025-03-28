@@ -1,228 +1,228 @@
-import type { LoaderFunctionArgs } from '@remix-run/node';
+import { useState, useEffect } from 'react';
+import { useParams, useLoaderData, Form, useFetcher } from '@remix-run/react';
+import type { LoaderFunctionArgs, ActionFunctionArgs, MetaFunction } from '@remix-run/node';
 import { json, redirect } from '@remix-run/node';
-import { useLoaderData } from '@remix-run/react';
-import { useEffect, useState, useRef } from 'react';
+import { supabase } from '~/lib/supabase';
+import { requirePlayer } from '~/lib/session.server'; // Require player role
 
-// Define types (consider moving to a shared types file)
-interface Question {
-  index: number;
-  text: string;
-  options: string[];
-  // timeLimit?: number;
-}
-interface PlayerResults {
-  isCorrect: boolean;
-  scoreEarned: number;
-  currentScore: number;
-  rank?: number; // Optional rank
-}
-interface FinalScores {
-   players: { nickname: string; score: number }[];
-}
-type GamePhase = 'connecting' | 'lobby' | 'question' | 'results' | 'ended' | 'error' | 'disconnected';
+export const meta: MetaFunction<typeof loader> = ({ data }) => {
+  const gamePin = data?.game?.game_pin ?? 'Play';
+  return [{ title: `Play Game: ${gamePin}` }];
+};
 
-interface GameState {
-  phase: GamePhase;
-  question?: Question;
-  results?: PlayerResults;
-  finalScores?: FinalScores;
-  error?: string;
-}
+// Loader: Fetch game data, ensure user is player, check game status
+export async function loader({ request, params }: LoaderFunctionArgs) {
+  const playerUser = await requirePlayer(request); // Ensures user is logged in and is NOT an admin
+  const gamePin = params.gameId?.toUpperCase();
 
-export async function loader({ params, request }: LoaderFunctionArgs) {
-  const gameId = params.gameId?.toUpperCase(); // Ensure uppercase
-  const url = new URL(request.url);
-  const nickname = url.searchParams.get('nickname');
-
-  if (!gameId || gameId.length !== 6) {
-    // Redirect back to join page if gameId is invalid
-    console.log("Invalid gameId format in loader:", gameId);
-    return redirect(`/play`);
-  }
-  if (!nickname) {
-    // Redirect back to join page if nickname is missing
-    console.log("Nickname missing in loader for game:", gameId);
-    return redirect(`/play?gameId=${gameId}`);
+  if (!gamePin) {
+    throw new Response('Game PIN not provided', { status: 400 });
   }
 
-  // Optional TODO: Server-side validation if gameId exists.
-  // This is difficult without querying the WS server state or DB.
-  // Relying on WS connection for now.
+  // Fetch the game details
+  const { data: game, error: gameError } = await supabase
+    .from('games')
+    .select('id, game_pin, status, host_id, current_question_index') // Select necessary fields
+    .eq('game_pin', gamePin)
+    .single();
 
-  return json({ gameId, nickname });
+  if (gameError || !game) {
+    console.error(`Error fetching game ${gamePin} or game not found:`, gameError);
+    throw new Response('Game not found.', { status: 404 });
+  }
+
+  // Check if player has already joined this game (using nickname for now, ideally user_id)
+  // This requires an action to handle joining first. Let's assume for now they might need to join.
+  // We'll add a check later once the join action exists.
+
+  // If game is not in lobby or active, maybe redirect or show message
+  if (!['lobby', 'active'].includes(game.status)) {
+     // Maybe redirect to a results page or back home?
+     // For now, let's allow viewing but disable interaction.
+     console.log(`Game ${gamePin} is in status ${game.status}.`);
+  }
+
+  // Fetch current players (RLS handles permissions)
+  const { data: players, error: playersError } = await supabase
+    .from('players')
+    .select('id, nickname, score')
+    .eq('game_id', game.id);
+
+   if (playersError) {
+     console.error('Error fetching players:', playersError);
+     // Non-critical? Return game data anyway?
+   }
+
+   // TODO: Fetch current question if game is active
+
+
+  return json({ game, players: players ?? [], playerUserId: playerUser.id });
 }
+
+// Action: Handle player joining the game (setting nickname)
+export async function action({ request, params }: ActionFunctionArgs) {
+    const playerUser = await requirePlayer(request);
+    const gamePin = params.gameId?.toUpperCase();
+    const formData = await request.formData();
+    const nickname = formData.get('nickname') as string;
+
+    if (!gamePin) {
+        return json({ error: 'Game PIN missing.' }, { status: 400 });
+    }
+    if (!nickname || nickname.trim().length === 0 || nickname.length > 20) {
+        return json({ error: 'Nickname must be between 1 and 20 characters.' }, { status: 400 });
+    }
+
+    // 1. Find the game ID from the PIN
+    const { data: game, error: gameError } = await supabase
+      .from('games')
+      .select('id, status')
+      .eq('game_pin', gamePin)
+      .single();
+
+    if (gameError || !game) {
+      return json({ error: 'Game not found.' }, { status: 404 });
+    }
+
+    // 2. Check if game is in lobby state (RLS also checks this on insert)
+    if (game.status !== 'lobby') {
+        return json({ error: 'Game is no longer accepting players.' }, { status: 403 });
+    }
+
+    // 3. Insert the player (RLS policy 'Allow authenticated non-admins to join games' will apply)
+    const { data: newPlayer, error: insertError } = await supabase
+        .from('players')
+        .insert({
+            game_id: game.id,
+            nickname: nickname.trim(),
+            // user_id: playerUser.id // TODO: Add user_id column to players table later
+        })
+        .select()
+        .single();
+
+    if (insertError) {
+        console.error('Error inserting player:', insertError);
+        // Check for unique constraint violation if nicknames must be unique per game
+        if (insertError.code === '23505') { // Unique violation
+             return json({ error: 'This nickname is already taken in this game.' }, { status: 409 });
+        }
+        return json({ error: 'Failed to join the game. ' + insertError.message }, { status: 500 });
+    }
+
+    console.log(`Player ${nickname} joined game ${gamePin}`);
+    // No redirect needed, the page will re-render via fetcher state change
+    return json({ success: true, player: newPlayer });
+}
+
 
 export default function PlayGame() {
-  const { gameId, nickname } = useLoaderData<typeof loader>();
-  const [gameState, setGameState] = useState<GameState>({ phase: 'connecting' });
-  const [hasAnswered, setHasAnswered] = useState(false); // Track if player answered current question
-  const ws = useRef<WebSocket | null>(null);
+  const { game, players, playerUserId } = useLoaderData<typeof loader>();
+  const params = useParams();
+  const gamePin = params.gameId;
+  const joinFetcher = useFetcher<typeof action>();
 
+  // Check if the current user is already in the players list
+  // TODO: This check needs improvement. Ideally, check based on playerUserId against a user_id on the players table.
+  // For now, we'll rely on the form submission state.
+  const hasJoined = players.some(p => p.nickname /* === user's chosen nickname? */); // Placeholder logic
+
+  const isJoining = joinFetcher.state !== 'idle';
+  const joinError = joinFetcher.data?.error;
+  const joinSuccess = joinFetcher.data?.success;
+
+
+  // TODO: Setup WebSocket connection for real-time game updates (status, questions, scores)
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
-    console.log(`Attempting to connect WebSocket to ${wsUrl}`);
-    ws.current = new WebSocket(wsUrl);
+    console.log(`Player connected for game: ${gamePin}`);
+    // Initialize WebSocket connection here if player has joined
+    // if (joinSuccess || hasJoined) {
+    //   const ws = new WebSocket(`ws://${window.location.host}/ws`);
+    //   ws.onopen = () => {
+    //     console.log('Player WebSocket connected');
+    //     // Send player identification message
+    //     ws.send(JSON.stringify({ type: 'identify_player', gamePin, /* nickname, playerId */ }));
+    //   };
+    //   // ... handle messages (game state changes, new questions)
+    //   return () => ws.close();
+    // }
+  }, [gamePin, joinSuccess, hasJoined]);
 
-    ws.current.onopen = () => {
-      console.log('Player WebSocket connected');
-      // Send join message
-      ws.current?.send(
-        JSON.stringify({
-          type: 'JOIN_GAME',
-          payload: { gameId, nickname },
-        })
-      );
-      // Initial state is connecting, wait for server confirmation or error
-    };
-
-    ws.current.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
-        console.log('Player received message:', message);
-
-        switch (message.type) {
-          case 'JOIN_SUCCESS': // Server confirms successful join
-             setGameState({ phase: 'lobby' });
-             break;
-          case 'GAME_STATE_UPDATE': // General state update (e.g., phase change)
-             // Be careful not to overwrite question/results data if phase matches
-             if (message.payload.phase && message.payload.phase !== gameState.phase) {
-                setGameState(prev => ({ ...prev, phase: message.payload.phase }));
-             }
-             // Handle other state updates if needed
-             break;
-          case 'SHOW_QUESTION':
-            setGameState({ phase: 'question', question: message.payload });
-            setHasAnswered(false); // Reset answered flag for new question
-            break;
-          case 'SHOW_RESULTS': // Results after a question
-             setGameState({ phase: 'results', results: message.payload });
-            break;
-          case 'GAME_ENDED':
-             setGameState({ phase: 'ended', finalScores: message.payload });
-             ws.current?.close();
-             break;
-          case 'ERROR':
-             console.error("Server error:", message.payload);
-             setGameState({ phase: 'error', error: message.payload || 'An unknown error occurred.' });
-             ws.current?.close(); // Close connection on error
-             break;
-          default:
-             console.log("Received unhandled message type:", message.type);
-        }
-      } catch (error) {
-        console.error('Error parsing message:', error);
-         setGameState({ phase: 'error', error: 'Received invalid message from server.' });
-      }
-    };
-
-    ws.current.onerror = (error) => {
-      console.error('Player WebSocket error:', error);
-      setGameState({ phase: 'error', error: 'WebSocket connection error.' });
-    };
-
-    ws.current.onclose = (event) => {
-      console.log('Player WebSocket disconnected', event.code, event.reason);
-       // Only show disconnected message if it wasn't a normal game end or an error state already
-       if (gameState.phase !== 'ended' && gameState.phase !== 'error') {
-         setGameState({ phase: 'disconnected' });
-       }
-    };
-
-    // Cleanup on component unmount
-    return () => {
-      console.log('Closing player WebSocket connection.');
-      ws.current?.close();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gameId, nickname]); // Effect dependencies
-
-
-  const submitAnswer = (answerIndex: number) => {
-     if (ws.current?.readyState === WebSocket.OPEN && !hasAnswered) {
-        ws.current?.send(JSON.stringify({ type: 'SUBMIT_ANSWER', payload: { gameId, answerIndex } }));
-        setHasAnswered(true); // Mark as answered
-        // Optionally update UI immediately to show "Answered" state
-     }
-  }
-
-  // --- Render logic based on gameState.phase ---
-  const renderContent = () => {
-     switch (gameState.phase) {
-        case 'connecting':
-           return <p className="text-xl animate-pulse">Connecting...</p>;
-        case 'lobby':
-           return <p className="text-xl">Waiting for the host to start the game...</p>;
-        case 'question':
-           if (!gameState.question) return <p>Waiting for question...</p>;
-           return (
-             <div className="w-full max-w-2xl text-center">
-               <h2 className="mb-6 text-2xl font-semibold">{gameState.question.text}</h2>
-               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                 {gameState.question.options.map((option: string, index: number) => (
-                   <button
-                     key={index}
-                     onClick={() => submitAnswer(index)}
-                     disabled={hasAnswered}
-                     className={`rounded p-4 text-lg font-semibold text-white shadow transition-opacity duration-150 ${
-                       hasAnswered
-                         ? 'cursor-not-allowed bg-gray-400 opacity-70'
-                         : 'bg-blue-500 hover:bg-blue-600'
-                     }`}
-                   >
-                     {option}
-                   </button>
-                 ))}
-               </div>
-                {hasAnswered && <p className="mt-6 text-lg font-semibold text-green-600">Answer submitted! Waiting for results...</p>}
-             </div>
-           );
-        case 'results':
-           if (!gameState.results) return <p>Waiting for results...</p>;
-           return (
-             <div className="text-center">
-               <h2 className={`text-3xl font-bold ${gameState.results.isCorrect ? 'text-green-500' : 'text-red-500'}`}>
-                  {gameState.results.isCorrect ? 'Correct!' : 'Incorrect'}
-               </h2>
-               <p className="mt-2 text-xl">Score Earned: +{gameState.results.scoreEarned}</p>
-               <p className="text-xl">Total Score: {gameState.results.currentScore}</p>
-               {gameState.results.rank && <p className="text-xl">Rank: {gameState.results.rank}</p>}
-               <p className="mt-6 text-lg italic">Waiting for next question...</p>
-             </div>
-           );
-        case 'ended':
-           if (!gameState.finalScores) return <p>Game Over!</p>;
-           return (
-             <div className="w-full max-w-md text-center">
-               <h2 className="mb-6 text-3xl font-bold">Game Over! Final Scores:</h2>
-               <ul className="space-y-2">
-                  {gameState.finalScores.players
-                     .sort((a, b) => b.score - a.score) // Sort by score descending
-                     .map((player, index) => (
-                        <li key={player.nickname} className="flex justify-between rounded bg-gray-100 p-3 text-lg dark:bg-gray-700">
-                           <span>{index + 1}. {player.nickname}</span>
-                           <span className="font-semibold">{player.score}</span>
-                        </li>
-                  ))}
-               </ul>
-             </div>
-           );
-        case 'error':
-           return <p className="text-xl text-red-500">Error: {gameState.error || 'An unknown error occurred.'}</p>;
-        case 'disconnected':
-           return <p className="text-xl text-orange-500">Disconnected from server.</p>;
-        default:
-           return <p>Loading...</p>;
-     }
-  }
 
   return (
-    <div className="flex h-screen flex-col items-center justify-center p-8 font-sans dark:bg-gray-900 dark:text-gray-100">
-      <p className="absolute top-4 right-4 text-sm text-gray-600 dark:text-gray-400">
-        Player: <strong>{nickname}</strong> | Game: <strong>{gameId}</strong>
-      </p>
-      {renderContent()}
+    <div className="p-6">
+      <h1 className="text-3xl font-bold mb-4">Playing Game: {game.game_pin}</h1>
+      <p className="mb-6">Status: <span className="font-semibold">{game.status}</span></p>
+
+      {/* Nickname Form (if game is lobby and user hasn't joined) */}
+      {game.status === 'lobby' && !joinSuccess && !hasJoined && ( // Adjust hasJoined logic later
+        <joinFetcher.Form method="post" className="max-w-sm mb-6 p-4 border rounded dark:border-gray-700">
+          <h2 className="text-xl font-semibold mb-3">Choose your nickname</h2>
+          <label htmlFor="nickname" className="block text-sm font-medium mb-1 dark:text-gray-300">
+            Nickname (1-20 characters)
+          </label>
+          <input
+            type="text"
+            id="nickname"
+            name="nickname"
+            required
+            maxLength={20}
+            className="w-full rounded border border-gray-300 px-3 py-2 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+          />
+          {joinError && (
+            <p className="mt-2 text-sm text-red-600 dark:text-red-400">{joinError}</p>
+          )}
+          <button
+            type="submit"
+            disabled={isJoining}
+            className="mt-3 w-full rounded bg-green-600 px-4 py-2 text-white hover:bg-green-700 disabled:opacity-50"
+          >
+            {isJoining ? 'Joining...' : 'Join Game'}
+          </button>
+        </joinFetcher.Form>
+      )}
+
+      {/* Waiting Room / Game Active UI */}
+      {(joinSuccess || hasJoined) && ( // Adjust hasJoined logic later
+        <div>
+          {game.status === 'lobby' && (
+            <p className="text-lg text-blue-700 dark:text-blue-300">Waiting for the host to start the game...</p>
+          )}
+          {game.status === 'active' && (
+            <div>
+              <h2 className="text-2xl font-semibold mb-4">Question {game.current_question_index + 1}</h2>
+              {/* TODO: Display current question and answer options */}
+              <p>Question text will appear here.</p>
+              <div className="grid grid-cols-2 gap-4 mt-4">
+                 {/* Example Answer Buttons */}
+                 <button className="bg-red-500 hover:bg-red-600 text-white font-bold py-4 px-4 rounded">Option A</button>
+                 <button className="bg-blue-500 hover:bg-blue-600 text-white font-bold py-4 px-4 rounded">Option B</button>
+                 <button className="bg-yellow-500 hover:bg-yellow-600 text-white font-bold py-4 px-4 rounded">Option C</button>
+                 <button className="bg-green-500 hover:bg-green-600 text-white font-bold py-4 px-4 rounded">Option D</button>
+              </div>
+            </div>
+          )}
+           {game.status === 'finished' && (
+             <p className="text-lg font-semibold text-purple-700 dark:text-purple-300">The game has finished!</p>
+             // TODO: Show final scores/leaderboard
+           )}
+        </div>
+      )}
+
+      {/* Player List */}
+      <h3 className="text-xl font-semibold mt-8 mb-3">Players in Game ({players.length})</h3>
+      {players.length > 0 ? (
+        <ul className="list-inside list-disc space-y-1">
+          {players.map((player) => (
+            <li key={player.id}>
+              {player.nickname}
+              {/* Maybe show score if game is active/finished */}
+              {/* (Score: {player.score}) */}
+            </li>
+          ))}
+        </ul>
+      ) : (
+         game.status === 'lobby' && !joinSuccess && !hasJoined ? null : <p>No players yet.</p> // Hide if showing nickname form
+      )}
     </div>
   );
 }

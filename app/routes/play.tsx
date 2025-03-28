@@ -1,95 +1,81 @@
-import { useState, useEffect } from 'react';
-import { Form, useSearchParams, useFetcher } from '@remix-run/react';
-import type { MetaFunction, ActionFunctionArgs } from '@remix-run/node';
+import { Form, Link, useLoaderData, useSearchParams } from '@remix-run/react';
+import type { LoaderFunctionArgs, MetaFunction } from '@remix-run/node';
 import { json, redirect } from '@remix-run/node';
+import { supabase } from '~/lib/supabase';
+import { requirePlayer } from '~/lib/session.server'; // Require player (non-admin)
 
 export const meta: MetaFunction = () => {
-  return [{ title: 'Join Quiz Game' }];
+  return [{ title: 'Join Game - Live Quiz' }];
 };
 
-// This action validates and redirects the player to the specific game lobby URL
-export async function action({ request }: ActionFunctionArgs) {
-  const formData = await request.formData();
-  const gameId = (formData.get('gameId') as string)?.toUpperCase(); // Ensure uppercase
-  const nickname = formData.get('nickname') as string;
+// Loader: Validate game PIN and user role
+export async function loader({ request }: LoaderFunctionArgs) {
+  const playerUser = await requirePlayer(request); // Ensures user is logged in and is NOT an admin
+  const url = new URL(request.url);
+  const gamePin = url.searchParams.get('gameId')?.toUpperCase();
 
-  if (!gameId || !nickname) {
-    return json({ error: 'Game PIN and Nickname are required.' }, { status: 400 });
+  if (!gamePin) {
+    // If no gameId in query params, maybe redirect back to index or show error?
+    // For now, just return null, the component will handle it.
+    return json({ gameExists: false, error: 'No Game PIN provided.', gamePin: null });
   }
-   if (gameId.length !== 6) {
-     return json({ error: 'Invalid Game PIN format.' }, { status: 400 });
-   }
 
-  // Optional TODO: Server-side validation if gameId exists and is in 'lobby' state.
-  // This might require querying the DB or having a way to check the WebSocket server's state.
-  // For now, we rely on the WebSocket connection in play.$gameId to handle invalid/started games.
+  // Check if a game with this PIN exists and is in 'lobby' state
+  const { data: game, error } = await supabase
+    .from('games')
+    .select('id, status')
+    .eq('game_pin', gamePin)
+    .single();
 
-  // Redirect to the game lobby, passing nickname via search params
-  const url = new URL(`/play/${gameId}`, request.url);
-  url.searchParams.set('nickname', nickname.trim()); // Trim nickname
-  return redirect(url.toString());
+  if (error || !game) {
+    console.warn(`Game PIN ${gamePin} not found or error:`, error);
+    return json({ gameExists: false, error: 'Invalid Game PIN.', gamePin });
+  }
+
+  if (game.status !== 'lobby') {
+     console.warn(`Attempt to join game ${gamePin} which is not in lobby (status: ${game.status})`);
+     return json({ gameExists: true, error: `Game is already ${game.status}. Cannot join now.`, gamePin });
+  }
+
+  // Game exists and is joinable, redirect to the specific game play page
+  // Pass user ID or nickname selection logic might happen here or on the next page
+  console.log(`Player ${playerUser.email} validated for game PIN ${gamePin}. Redirecting to play/${gamePin}`);
+  return redirect(`/play/${gamePin}`);
+
+  // If we wanted to stay on this page and show a nickname form:
+  // return json({ gameExists: true, error: null, gamePin });
 }
 
-
-export default function JoinGame() {
+// This component might not be reached if the loader always redirects on success.
+// It acts as a validation/routing step.
+// If we modified the loader to NOT redirect, this component would render.
+export default function JoinGameLander() {
+  const { gameExists, error, gamePin } = useLoaderData<typeof loader>();
   const [searchParams] = useSearchParams();
-  const [gameId, setGameId] = useState('');
-  const joinFetcher = useFetcher<typeof action>();
+  const initialPin = searchParams.get('gameId') ?? ''; // Get initial PIN from URL if any
 
-  // Pre-fill gameId if it's in the URL from the index page link
-  useEffect(() => {
-    const initialGameId = searchParams.get('gameId');
-    if (initialGameId) {
-      setGameId(initialGameId.toUpperCase());
-    }
-  }, [searchParams]);
-
-  const isJoining = joinFetcher.state !== 'idle';
-
+  // This UI will only show if the loader finds an error or doesn't redirect
   return (
-    <div className="flex h-screen flex-col items-center justify-center gap-8 p-8 font-sans dark:bg-gray-900">
-      <h1 className="text-3xl font-bold dark:text-gray-100">Join Game</h1>
-      <joinFetcher.Form
-        method="post"
-        className="flex w-full max-w-xs flex-col gap-4"
-      >
-        <label htmlFor="gameId" className="sr-only">Game PIN</label>
-        <input
-          type="text"
-          id="gameId"
-          name="gameId"
-          value={gameId}
-          onChange={(e) => setGameId(e.target.value.toUpperCase())}
-          placeholder="Enter Game PIN"
-          maxLength={6}
-          className="rounded border border-gray-300 px-4 py-2 text-center text-lg uppercase tracking-widest focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-          required
-          autoCapitalize="characters"
-          autoComplete="off"
-        />
-         <label htmlFor="nickname" className="sr-only">Nickname</label>
-        <input
-          type="text"
-          id="nickname"
-          name="nickname"
-          placeholder="Enter Nickname"
-          maxLength={20}
-          className="rounded border border-gray-300 px-4 py-2 text-lg focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-          required
-          autoComplete="off"
-        />
-        {/* Display validation errors from the action */}
-        {joinFetcher.data?.error && (
-          <p className="text-center text-red-500">{joinFetcher.data.error}</p>
-        )}
-        <button
-          type="submit"
-          disabled={isJoining}
-          className="mt-2 rounded-lg bg-green-600 px-6 py-3 text-lg font-semibold text-white shadow transition-colors duration-150 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {isJoining ? 'Joining...' : 'Enter'}
-        </button>
-      </joinFetcher.Form>
+    <div className="flex flex-col items-center justify-center gap-6 p-8">
+      <h1 className="text-3xl font-bold text-gray-800 dark:text-gray-100">Join Game</h1>
+      {error && (
+        <div className="w-full max-w-md p-4 text-center text-red-700 bg-red-100 border border-red-400 rounded dark:bg-red-900 dark:text-red-200 dark:border-red-700">
+          <p>{error}</p>
+          <Link to="/" className="mt-2 inline-block text-blue-600 hover:underline dark:text-blue-400">
+            Go back home
+          </Link>
+        </div>
+      )}
+
+      {/* Optionally show a form again if needed, though index handles initial entry */}
+       {!error && !gameExists && (
+         <p>Enter a game PIN on the home page to join.</p>
+         // Or show the form again here
+       )}
+
+       {/* If loader didn't redirect, maybe show nickname form here */}
+       {/* {gameExists && !error && ( ... Nickname Form ... )} */}
+
     </div>
   );
 }

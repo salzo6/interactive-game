@@ -1,36 +1,49 @@
 import { createClient } from '@supabase/supabase-js';
 
-// Vite exposes env variables through import.meta.env for client-side code
-// Remix server-side code uses process.env
-// Use VITE_ prefix as required by Vite to expose to the client,
-// and ensure they are loaded server-side as well.
-const supabaseUrl = import.meta.env?.VITE_SUPABASE_URL ?? process.env.VITE_SUPABASE_URL;
-const supabaseAnonKey = import.meta.env?.VITE_SUPABASE_ANON_KEY ?? process.env.VITE_SUPABASE_ANON_KEY;
+// Access environment variables for client/server
+// Client-side: Vite uses import.meta.env (available after build or in dev)
+// Server-side: Node.js uses process.env (loaded via Vite/Remix)
+// Client-side access relies on vars being exposed via window.ENV in root.tsx
+const supabaseUrl = typeof document === 'undefined'
+  ? process.env.VITE_SUPABASE_URL // Server
+  : window.ENV.VITE_SUPABASE_URL; // Client
+
+const supabaseAnonKey = typeof document === 'undefined'
+  ? process.env.VITE_SUPABASE_ANON_KEY // Server
+  : window.ENV.VITE_SUPABASE_ANON_KEY; // Client
 
 
 // Basic check to ensure variables are loaded
 if (!supabaseUrl) {
   console.error('Error: VITE_SUPABASE_URL environment variable is not set.');
-  // Throw an error to prevent SupabaseClient initialization with undefined
-  throw new Error('VITE_SUPABASE_URL is not defined. Please check your .env file.');
+  throw new Error('VITE_SUPABASE_URL is not defined. Check server env and client exposure.');
 }
 if (!supabaseAnonKey) {
   console.error('Error: VITE_SUPABASE_ANON_KEY environment variable is not set.');
-  // Throw an error
-  throw new Error('VITE_SUPABASE_ANON_KEY is not defined. Please check your .env file.');
+  throw new Error('VITE_SUPABASE_ANON_KEY is not defined. Check server env and client exposure.');
 }
 
-// Validate the URL format (basic check)
-try {
-  new URL(supabaseUrl);
-} catch (e) {
-  console.error('Error: Invalid VITE_SUPABASE_URL format.', e);
-  throw new Error(`Invalid VITE_SUPABASE_URL format: ${supabaseUrl}`);
+// Validate the URL format (basic check) - only if URL is present
+if (supabaseUrl) {
+    try {
+      new URL(supabaseUrl);
+    } catch (e) {
+      console.error('Error: Invalid VITE_SUPABASE_URL format.', e);
+      throw new Error(`Invalid VITE_SUPABASE_URL format: ${supabaseUrl}`);
+    }
 }
 
 
 // Create and export the Supabase client
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// We pass the storage option only on the client-side to enable session persistence
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+        // Only use localStorage on the client-side
+        persistSession: typeof document !== 'undefined',
+        // autoRefreshToken: typeof document !== 'undefined', // default is true
+        // detectSessionInUrl: typeof document !== 'undefined', // default is true
+    }
+});
 
 // Optionally, define types based on your DB schema here or in a separate file
 // export type Json = string | number | boolean | null | { [key: string]: Json | undefined } | Json[]
