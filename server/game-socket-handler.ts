@@ -1,31 +1,30 @@
 import type { WebSocket } from 'ws';
 import type * as http from 'http';
 import { nanoid } from 'nanoid';
-import { supabase } from '../app/lib/supabase'; // Import the Supabase client
+import { supabase } from '../app/lib/supabase';
 
 // --- Types ---
 interface Player {
-  id: string;
+  id: string; // Corresponds to Supabase 'players' table id (UUID)
   nickname: string;
   score: number;
-  ws: WebSocket; // Reference to the WebSocket connection
+  ws: WebSocket | null; // Reference to the WebSocket connection (can be null initially)
 }
 
 interface GameState {
   gameId: string; // Corresponds to the Supabase 'games' table ID
-  gamePin: string; // The user-facing PIN (needed for potential re-query if necessary)
-  hostWs: WebSocket | null; // Reference to the host's WebSocket
-  players: Map<string, Player>; // Map playerId to Player object
+  gamePin: string;
+  hostWs: WebSocket | null;
+  players: Map<string, Player>; // Map playerId (UUID) to Player object
   currentQuestionIndex: number;
   gamePhase: 'lobby' | 'question' | 'leaderboard' | 'ended';
+  sharedAdminState: number; // New shared state controlled by admin
   // TODO: Add quiz questions array
 }
 
 // --- In-Memory State ---
-// WARNING: This state is lost on server restart. Use a database for persistence.
-const games = new Map<string, GameState>(); // Key is gameId (UUID)
-// Map WebSocket instances to player/game info for easy cleanup on disconnect
-const wsClientMap = new Map<WebSocket, { gameId: string; playerId: string }>(); // playerId can be 'host_{gameId}'
+const games = new Map<string, GameState>();
+const wsClientMap = new Map<WebSocket, { gameId: string; clientId: string; isHost: boolean }>(); // clientId is host_id or player_id
 
 // --- WebSocket Message Handler ---
 export function handleWebSocket(ws: WebSocket, req: http.IncomingMessage) {
@@ -37,103 +36,113 @@ export function handleWebSocket(ws: WebSocket, req: http.IncomingMessage) {
       console.log('Received message:', message);
 
       const { type, payload } = message;
-      const clientInfo = wsClientMap.get(ws); // Get existing info if client is known
+      const clientInfo = wsClientMap.get(ws);
 
       switch (type) {
         case 'HOST_JOIN': {
-          const { gameId, gamePin } = payload; // Expect gameId (UUID) and gamePin now
+          const { gameId, gamePin } = payload;
           if (!gameId || !gamePin) {
              send(ws, { type: 'ERROR', payload: 'Missing gameId or gamePin for host join.' });
-             ws.close();
-             return;
+             ws.close(); return;
           }
-          const game = findOrCreateGame(gameId, gamePin); // Pass gamePin too
+          const game = findOrCreateGame(gameId, gamePin);
           if (game.hostWs && game.hostWs !== ws) {
              send(ws, { type: 'ERROR', payload: 'Game already has a host.' });
-             ws.close();
-             return;
+             ws.close(); return;
           }
           game.hostWs = ws;
-          const hostId = `host_${gameId}`;
-          wsClientMap.set(ws, { gameId, playerId: hostId });
+          // Use game.gameId as the unique identifier for the host in this context
+          const hostClientId = `host_${gameId}`;
+          wsClientMap.set(ws, { gameId, clientId: hostClientId, isHost: true });
           console.log(`Host joined game ${gameId} (PIN: ${gamePin})`);
+
+          // Send initial state to host
           sendPlayerListUpdate(gameId);
+          sendSharedStateUpdate(gameId, game.sharedAdminState, ws); // Send current shared state ONLY to host initially
           break;
         }
 
-        case 'JOIN_GAME': {
-          // Player joins using the GAME PIN. We need to find the gameId (UUID) from the PIN.
-          const { gamePin, nickname } = payload;
-          if (!gamePin || !nickname) {
-             send(ws, { type: 'ERROR', payload: 'Missing gamePin or nickname.' });
-             ws.close();
-             return;
+        // Player identifies their WebSocket connection *after* joining via Remix action
+        case 'PLAYER_IDENTIFY': {
+          const { gameId, playerId, nickname } = payload; // Expect gameId (UUID) and playerId (UUID)
+          if (!gameId || !playerId || !nickname) {
+             send(ws, { type: 'ERROR', payload: 'Missing gameId, playerId, or nickname for player identify.' });
+             ws.close(); return;
           }
 
-          // Find gameId by gamePin (inefficient, consider a map if many games)
-          let game: GameState | undefined;
-          let gameId: string | undefined;
-          for (const [id, g] of games.entries()) {
-              if (g.gamePin === gamePin) {
-                  game = g;
-                  gameId = id;
-                  break;
-              }
-          }
-
-          if (!game || !gameId) {
-            // Attempt to fetch from DB if not in memory (e.g., server restart) - Optional advanced feature
-            console.log(`Game with PIN ${gamePin} not found in memory.`);
+          const game = games.get(gameId);
+          if (!game) {
+            console.log(`Game ${gameId} not found for player identify.`);
             send(ws, { type: 'ERROR', payload: 'Game not found.' });
-            ws.close();
-            return;
+            ws.close(); return;
           }
 
-          if (game.gamePhase !== 'lobby') {
-             send(ws, { type: 'ERROR', payload: 'Game has already started.' });
-             ws.close();
-             return;
+          // Check if player already exists in memory (might happen on reconnect)
+          let player = game.players.get(playerId);
+
+          if (!player) {
+            // If player not in memory (e.g., server restart or first connection after join action), create entry
+            console.log(`Player ${nickname} (${playerId}) identifying, adding to game ${gameId} memory.`);
+            player = { id: playerId, nickname: nickname, score: 0, ws: ws };
+            game.players.set(playerId, player);
+          } else {
+             // Player exists, just update WebSocket reference
+             console.log(`Player ${nickname} (${playerId}) re-identifying in game ${gameId}.`);
+             player.ws = ws;
           }
 
-          let uniqueNickname = nickname;
-          let counter = 1;
-          while (Array.from(game.players.values()).some(p => p.nickname === uniqueNickname)) {
-             uniqueNickname = `${nickname}_${counter++}`;
-          }
+          wsClientMap.set(ws, { gameId, clientId: playerId, isHost: false });
 
-          const playerId = nanoid(8);
-          const newPlayer: Player = { id: playerId, nickname: uniqueNickname, score: 0, ws };
-          game.players.set(playerId, newPlayer);
-          wsClientMap.set(ws, { gameId, playerId }); // Use the found gameId (UUID)
+          console.log(`Player ${nickname} (${playerId}) identified WebSocket for game ${gameId}`);
 
-          console.log(`Player ${uniqueNickname} (${playerId}) joined game ${gameId} (PIN: ${gamePin})`);
-
-          send(ws, { type: 'JOIN_SUCCESS', payload: { playerId, nickname: uniqueNickname, gameId } }); // Send gameId back
-          sendPlayerListUpdate(gameId);
+          // Send initial state to player
+          send(ws, { type: 'IDENTIFY_SUCCESS', payload: { message: 'WebSocket identified successfully.' } });
+          sendPlayerListUpdate(gameId); // Update everyone
+          sendSharedStateUpdate(gameId, game.sharedAdminState, ws); // Send current shared state ONLY to this player initially
           break;
         }
 
         case 'START_GAME': {
-           if (!clientInfo) return;
-           const game = games.get(clientInfo.gameId);
-           if (!game || game.hostWs !== ws) {
-              send(ws, { type: 'ERROR', payload: 'Only the host can start the game.' });
-              return;
+           if (!clientInfo || !clientInfo.isHost) {
+              send(ws, { type: 'ERROR', payload: 'Only the host can start the game.' }); return;
            }
+           const game = games.get(clientInfo.gameId);
+           if (!game) return; // Should not happen if clientInfo exists
            if (game.gamePhase !== 'lobby') return;
 
            console.log(`Starting game ${clientInfo.gameId}`);
            game.gamePhase = 'question';
            game.currentQuestionIndex = 0;
            // TODO: Update game status in DB to 'active'
+           broadcast(clientInfo.gameId, { type: 'GAME_STARTED' }); // Notify clients game has started
            sendQuestion(clientInfo.gameId);
            break;
         }
 
+        case 'ADMIN_UPDATE_SHARED_STATE': {
+            if (!clientInfo || !clientInfo.isHost) {
+                send(ws, { type: 'ERROR', payload: 'Only the host can update the state.' }); return;
+            }
+            const game = games.get(clientInfo.gameId);
+            if (!game) return;
+
+            const { newState } = payload;
+            if (typeof newState !== 'number') {
+                send(ws, { type: 'ERROR', payload: 'Invalid state value.' }); return;
+            }
+
+            console.log(`Host updating shared state for game ${clientInfo.gameId} to ${newState}`);
+            game.sharedAdminState = newState;
+            // Broadcast the update to everyone
+            sendSharedStateUpdate(clientInfo.gameId, newState);
+            break;
+        }
+
+
         case 'SUBMIT_ANSWER': {
-           if (!clientInfo) return;
+           if (!clientInfo || clientInfo.isHost) return; // Only players submit
            const game = games.get(clientInfo.gameId);
-           const player = game?.players.get(clientInfo.playerId);
+           const player = game?.players.get(clientInfo.clientId); // clientId is playerId for players
            if (!game || !player || game.gamePhase !== 'question') return;
 
            const { answerIndex } = payload;
@@ -155,68 +164,55 @@ export function handleWebSocket(ws: WebSocket, req: http.IncomingMessage) {
     }
   });
 
-  ws.on('close', async () => { // Make the handler async
+  ws.on('close', async () => {
     const clientInfo = wsClientMap.get(ws);
     if (clientInfo) {
-      const { gameId, playerId } = clientInfo;
+      const { gameId, clientId, isHost } = clientInfo;
       const game = games.get(gameId);
-      wsClientMap.delete(ws); // Remove from map regardless
+      wsClientMap.delete(ws);
 
       if (game) {
-        // Check if the host disconnected
-        if (game.hostWs === ws) {
+        if (isHost) {
+          // HOST DISCONNECTED
           console.log(`Host disconnected from game ${gameId}. Deleting game.`);
-          game.hostWs = null; // Clear host reference in memory
+          game.hostWs = null;
 
-          // 1. Notify all remaining players the game is ending
-          broadcast(gameId, { type: 'GAME_ENDED', payload: 'Host disconnected and game has ended.' }, ws); // Exclude the disconnecting host
+          broadcast(gameId, { type: 'GAME_ENDED', payload: 'Host disconnected and game has ended.' }, ws);
 
-          // 2. Attempt to delete the game from Supabase
           try {
-            // IMPORTANT: Supabase client needs the user's JWT for RLS check on DELETE.
-            // This basic setup uses the anon key, which might fail depending on RLS.
-            // A more robust solution involves passing the host's JWT or using a service role key.
-            // Assuming RLS "Allow host to delete their own game" might work if the client implicitly uses the host's session.
-            const { error } = await supabase
-              .from('games')
-              .delete()
-              .eq('id', gameId); // Use the UUID gameId
-
-            if (error) {
-              console.error(`Error deleting game ${gameId} from database (RLS might be blocking):`, error);
-              // Log the error but continue cleanup
-            } else {
-              console.log(`Game ${gameId} successfully deleted from database.`);
-            }
+            const { error } = await supabase.from('games').delete().eq('id', gameId);
+            if (error) console.error(`Error deleting game ${gameId} from database (RLS might be blocking):`, error);
+            else console.log(`Game ${gameId} successfully deleted from database.`);
           } catch (dbError) {
             console.error(`Exception during database deletion for game ${gameId}:`, dbError);
           }
 
-          // 3. Clean up in-memory game state
           games.delete(gameId);
 
-          // 4. Close remaining player connections for this game and clean up their map entries
           console.log(`Closing connections for remaining players in game ${gameId}...`);
           game.players.forEach(p => {
-             if (p.ws.readyState === WebSocket.OPEN || p.ws.readyState === WebSocket.CONNECTING) {
-                 p.ws.close(1000, 'Host disconnected'); // Close with a reason
+             if (p.ws && (p.ws.readyState === WebSocket.OPEN || p.ws.readyState === WebSocket.CONNECTING)) {
+                 p.ws.close(1000, 'Host disconnected');
              }
-             wsClientMap.delete(p.ws); // Ensure cleanup from the map
+             // Also remove players associated with this game from wsClientMap
+             if(p.ws) wsClientMap.delete(p.ws);
           });
           console.log(`Cleanup complete for game ${gameId}.`);
 
         } else {
-          // A player disconnected
-          const player = game.players.get(playerId);
+          // PLAYER DISCONNECTED
+          const player = game.players.get(clientId); // clientId is playerId
           if (player) {
              console.log(`Player ${player.nickname} disconnected from game ${gameId}`);
-             game.players.delete(playerId);
-             // Notify host and remaining players
-             sendPlayerListUpdate(gameId);
+             // Don't delete player record from map immediately, just set ws to null
+             // They might reconnect and re-identify
+             player.ws = null;
+             // Notify host and remaining players about the disconnect (optional, or just update list)
+             sendPlayerListUpdate(gameId); // Update list for everyone
           }
         }
       } else {
-         console.log(`Game ${gameId} not found in memory during disconnect cleanup for player ${playerId}.`);
+         console.log(`Game ${gameId} not found in memory during disconnect cleanup for client ${clientId}.`);
       }
     } else {
         console.log("Disconnected client was not found in the wsClientMap.");
@@ -226,24 +222,22 @@ export function handleWebSocket(ws: WebSocket, req: http.IncomingMessage) {
 
 // --- Helper Functions ---
 
-// Now requires gamePin when creating
 function findOrCreateGame(gameId: string, gamePin: string): GameState {
   if (!games.has(gameId)) {
     console.log(`Creating new game state for ${gameId} (PIN: ${gamePin})`);
     games.set(gameId, {
       gameId: gameId,
-      gamePin: gamePin, // Store the pin
+      gamePin: gamePin,
       hostWs: null,
       players: new Map<string, Player>(),
       currentQuestionIndex: -1,
       gamePhase: 'lobby',
+      sharedAdminState: 0, // Initialize shared state
     });
   }
-  // Type assertion is safe here because we ensure it exists
   return games.get(gameId)!;
 }
 
-// Send message to a single client
 function send(ws: WebSocket, message: any) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
@@ -252,51 +246,52 @@ function send(ws: WebSocket, message: any) {
   }
 }
 
-// Broadcast message to all clients (host and players) in a specific game
 function broadcast(gameId: string, message: any, excludeWs?: WebSocket) {
   const game = games.get(gameId);
   if (!game) {
       console.warn(`Attempted to broadcast to non-existent game ${gameId}`);
       return;
   }
-
   const messageString = JSON.stringify(message);
 
-  // Send to host if connected and not excluded
+  // Send to host
   if (game.hostWs && game.hostWs !== excludeWs && game.hostWs.readyState === WebSocket.OPEN) {
-    try {
-        game.hostWs.send(messageString);
-    } catch (e) {
-        console.error(`Error sending message to host of game ${gameId}:`, e);
-    }
+    try { game.hostWs.send(messageString); } catch (e) { console.error(`Error sending to host:`, e); }
   }
 
-  // Send to all players if connected and not excluded
+  // Send to all players with active connections
   game.players.forEach((player) => {
-    if (player.ws !== excludeWs && player.ws.readyState === WebSocket.OPEN) {
-       try {
-           player.ws.send(messageString);
-       } catch (e) {
-           console.error(`Error sending message to player ${player.nickname} in game ${gameId}:`, e);
-       }
+    if (player.ws && player.ws !== excludeWs && player.ws.readyState === WebSocket.OPEN) {
+       try { player.ws.send(messageString); } catch (e) { console.error(`Error sending to player ${player.nickname}:`, e); }
     }
   });
 }
 
-
-// Send the current player list to the host
+// Send the current player list to ALL connected clients in the game
 function sendPlayerListUpdate(gameId: string) {
    const game = games.get(gameId);
-   // Check if hostWs exists and is OPEN before sending
-   if (!game || !game.hostWs || game.hostWs.readyState !== WebSocket.OPEN) {
-       if (game && !game.hostWs) console.log(`Cannot send player list update for game ${gameId}: Host not connected.`);
-       else if (game && game.hostWs.readyState !== WebSocket.OPEN) console.log(`Cannot send player list update for game ${gameId}: Host socket not open (state: ${game.hostWs.readyState}).`);
-       return;
-   }
+   if (!game) return;
 
+   // Include only players with active WS connections? Or all joined players? Let's send all joined.
+   // Filter out the 'ws' property before sending
    const playerList = Array.from(game.players.values()).map(({ id, nickname, score }) => ({ id, nickname, score }));
-   send(game.hostWs, { type: 'PLAYER_LIST_UPDATE', payload: { players: playerList } });
+   console.log(`Broadcasting player list update for game ${gameId}:`, playerList);
+   broadcast(gameId, { type: 'PLAYER_LIST_UPDATE', payload: { players: playerList } });
 }
+
+// Send the shared admin state update to clients
+// If targetWs is provided, sends only to that client, otherwise broadcasts
+function sendSharedStateUpdate(gameId: string, state: number, targetWs?: WebSocket) {
+    const message = { type: 'SHARED_STATE_UPDATE', payload: { newState: state } };
+    if (targetWs) {
+        console.log(`Sending shared state ${state} to specific client in game ${gameId}`);
+        send(targetWs, message);
+    } else {
+        console.log(`Broadcasting shared state ${state} for game ${gameId}`);
+        broadcast(gameId, message);
+    }
+}
+
 
 // Send the current question to all players
 function sendQuestion(gameId: string) {
