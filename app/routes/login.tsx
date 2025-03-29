@@ -3,7 +3,7 @@ import { Form, Link, useActionData, useSearchParams } from '@remix-run/react';
 import type { ActionFunctionArgs, LoaderFunctionArgs, MetaFunction } from '@remix-run/node';
 import { json, redirect } from '@remix-run/node';
 import { supabase } from '~/lib/supabase';
-import { createSession, getSupabaseSession } from '~/lib/session.server'; // Import session helpers
+import { createSessionCookie, getSupabaseSessionFromCookie } from '~/lib/session.server'; // Updated import
 
 export const meta: MetaFunction = () => {
   return [{ title: 'Login - Live Quiz' }];
@@ -11,36 +11,51 @@ export const meta: MetaFunction = () => {
 
 // Loader: Redirect if already logged in
 export async function loader({ request }: LoaderFunctionArgs) {
-  const session = await getSupabaseSession(request);
+  console.log("--- [login.tsx loader] --- Start");
+  const session = await getSupabaseSessionFromCookie(request); // Use correct function
   if (session) {
+    console.log("[login.tsx loader] User already logged in, redirecting to /");
     return redirect('/'); // Redirect logged-in users away from login page
   }
+  console.log("--- [login.tsx loader] --- End (User not logged in)");
   return json({}); // Must return something
 }
 
 // Action: Handle login form submission
 export async function action({ request }: ActionFunctionArgs) {
+  console.log("\n--- [login.tsx action] --- Start");
   const formData = await request.formData();
   const email = formData.get('email') as string;
   const password = formData.get('password') as string;
   const redirectTo = (formData.get('redirectTo') as string) || '/'; // Get redirect path
+  console.log(`[login.tsx action] Attempting login for email: ${email}, redirectTo: ${redirectTo}`);
 
   if (!email || !password) {
+    console.error('[login.tsx action] Error: Email or password missing.');
     return json({ error: 'Email and password are required.' }, { status: 400 });
   }
 
+  console.log('[login.tsx action] Calling supabase.auth.signInWithPassword...');
   const { data, error } = await supabase.auth.signInWithPassword({
     email,
     password,
   });
 
   if (error || !data.session) {
-    console.error('Login error:', error?.message);
+    console.error('[login.tsx action] Supabase signInWithPassword error:', error?.message || 'No session data returned.');
     return json({ error: error?.message || 'Login failed. Please check your credentials.' }, { status: 401 });
   }
 
-  // Create Remix session and redirect
-  return createSession(data.session, redirectTo);
+  console.log('[login.tsx action] Supabase login successful. Session data received.');
+  console.log('[login.tsx action] Calling createSessionCookie...');
+  try {
+    const response = await createSessionCookie(data.session, redirectTo);
+    console.log("--- [login.tsx action] --- End Success (Redirecting)");
+    return response;
+  } catch (sessionError: any) {
+      console.error('[login.tsx action] Error creating session cookie:', sessionError);
+      return json({ error: 'Failed to create user session after login.' }, { status: 500 });
+  }
 }
 
 export default function Login() {

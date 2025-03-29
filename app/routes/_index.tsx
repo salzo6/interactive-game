@@ -2,17 +2,49 @@ import { Form, Link, useLoaderData } from '@remix-run/react';
 import type { LoaderFunctionArgs } from '@remix-run/node';
 import { json } from '@remix-run/node';
 import { getSession, getUser } from '~/lib/session.server'; // Import session utilities
-import { supabase } from '~/lib/supabase'; // Import supabase client if needed for other data
+// import { supabase } from '~/lib/supabase'; // Avoid importing client-side supabase here if not needed
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await getUser(request);
-  const isAdmin = user?.user_metadata?.is_admin ?? false;
-  // You could potentially fetch active games here if needed, but keep it simple for now
-  return json({ user, isAdmin });
+  console.log("--- [_index.tsx loader] --- Start");
+  try {
+    const user = await getUser(request);
+    console.log("[_index.tsx loader] User fetched:", user ? user.email : 'null');
+    const isAdmin = user?.user_metadata?.is_admin ?? false;
+    console.log("[_index.tsx loader] isAdmin:", isAdmin);
+    // You could potentially fetch active games here if needed, but keep it simple for now
+    const responseData = { user, isAdmin };
+    console.log("--- [_index.tsx loader] --- End Success");
+    return json(responseData);
+  } catch (error) {
+      console.error("--- [_index.tsx loader] --- ERROR:", error);
+      // Return an error state that the component can handle, or re-throw
+      return json({ error: "Failed to load index data." }, { status: 500 });
+      // throw error;
+  }
 }
 
 export default function Index() {
-  const { user, isAdmin } = useLoaderData<typeof loader>();
+  const loaderData = useLoaderData<typeof loader>();
+
+  // Handle potential error state from the loader
+  if ('error' in loaderData) {
+     return (
+      <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-red-50 dark:bg-red-900">
+        <div className="text-center p-8 bg-white dark:bg-gray-800 shadow-xl rounded-lg">
+          <h1 className="text-2xl font-bold text-red-700 dark:text-red-300">Error Loading Page</h1>
+          <p className="text-red-600 dark:text-red-400 mt-2">{loaderData.error}</p>
+           <p className="mt-4 text-sm text-gray-600 dark:text-gray-400">Please try refreshing the page or contact support if the problem persists.</p>
+           <Link to="/" className="mt-6 inline-block rounded bg-blue-600 px-4 py-2 text-white font-semibold hover:bg-blue-700">
+             Go Home
+           </Link>
+        </div>
+      </div>
+    );
+  }
+
+  // Destructure safely now that we know 'error' isn't present
+  const { user, isAdmin } = loaderData;
+
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-100 via-purple-100 to-pink-100 dark:from-gray-900 dark:via-indigo-900 dark:to-purple-900 flex flex-col items-center justify-center p-4">
@@ -62,8 +94,9 @@ export default function Index() {
             {isAdmin && (
               <div className="border-t pt-6 dark:border-gray-700">
                 <h2 className="text-xl font-semibold text-gray-700 dark:text-gray-200 mb-4">Admin Actions</h2>
+                {/* Ensure this links to /host which triggers the creation action */}
                 <Link
-                  to="/host" // Link to the page where hosting starts
+                  to="/host"
                   className="w-full block text-center rounded bg-green-600 px-4 py-2 text-white font-semibold hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 dark:focus:ring-offset-gray-800 mb-4"
                 >
                   Host New Game

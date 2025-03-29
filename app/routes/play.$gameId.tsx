@@ -1,9 +1,8 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useLoaderData, useFetcher } from '@remix-run/react';
-import type { LoaderFunctionArgs, ActionFunctionArgs, MetaFunction } from '@remix-run/node';
-import { json } from '@remix-run/node';
-import { supabase } from '~/lib/supabase';
-import { requirePlayer } from '~/lib/session.server';
+import type { ActionFunctionArgs, LoaderFunctionArgs, MetaFunction } from '@remix-run/node';
+import { json, redirect } from '@remix-run/node';
+import { Form, Link, useActionData, useLoaderData, useNavigation } from '@remix-run/react';
+import { useEffect, useRef, useState } from 'react';
+import { requirePlayer, createServerClient } from '~/lib/session.server'; // Import server client creator
 
 // Define Player type for frontend state
 interface PlayerInfo {
@@ -12,367 +11,374 @@ interface PlayerInfo {
   score: number;
 }
 
-// Define type for successful join action data
-interface JoinSuccessData {
-    success: true;
-    player: {
-        id: string; // Player UUID from DB
-        nickname: string;
-        game_id: string; // Game UUID from DB
-        // user_id: string | null; // If you add this later
-        created_at: string;
-        score: number;
-    };
-}
-
-// Define type for join action error data
-interface JoinErrorData {
-    error: string;
-}
-
-type JoinActionData = JoinSuccessData | JoinErrorData | undefined;
-
-
 export const meta: MetaFunction<typeof loader> = ({ data }) => {
-  const gamePin = data?.game?.game_pin ?? 'Play';
-  return [{ title: `Play Game: ${gamePin}` }];
+  const gamePin = data?.game?.game_pin;
+  return [{ title: gamePin ? `Join Game ${gamePin} - Live Quiz` : 'Join Game - Live Quiz' }];
 };
 
+// Loader: Fetch game details for display and initial validation
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  const url = new URL(request.url);
-  console.log(`\n--- [play.$gameId.tsx loader] --- Handling request for path: ${url.pathname}`);
-  console.log(`[play.$gameId.tsx loader] Params received:`, params);
+  const playerUser = await requirePlayer(request); // Ensure user is logged in and is a player
+  const gamePin = params.gameId?.toUpperCase();
 
-  const playerUser = await requirePlayer(request);
-  const gamePin = params.gameId?.toUpperCase(); // Get PIN from route segment
-
-  console.log(`[play.$gameId.tsx loader] Extracted gamePin from route params: ${gamePin}`);
+  console.log(`\n--- [play.$gameId.tsx loader] --- Handling request for game PIN: ${gamePin}`);
 
   if (!gamePin) {
-    console.error("[play.$gameId.tsx loader] CRITICAL: No gameId found in route parameters!");
-    // This should ideally not happen if Remix routing is correct
-    throw new Response('Game PIN missing in route parameters.', { status: 400 });
+    console.error("[play.$gameId.tsx loader] No gamePin found in route params.");
+    throw redirect('/play'); // Redirect to the page asking for a PIN
   }
 
-  const { data: game, error: gameError } = await supabase
+  let supabase;
+  try {
+    console.log("[play.$gameId.tsx loader] Attempting to create server client...");
+    supabase = createServerClient(request); // Use authenticated server client
+    console.log("[play.$gameId.tsx loader] Server client created. Type:", typeof supabase);
+    if (!supabase || typeof supabase.from !== 'function') {
+        console.error("[play.$gameId.tsx loader] Failed to create a valid Supabase client or client is malformed.");
+        throw new Error("Failed to initialize database connection.");
+    }
+    console.log("[play.$gameId.tsx loader] Supabase client seems valid. Proceeding with query...");
+  } catch (error) {
+      console.error("[play.$gameId.tsx loader] Error creating Supabase client:", error);
+      throw json({ error: "Internal server error initializing database connection." }, { status: 500 });
+  }
+
+  console.log(`[play.$gameId.tsx loader] Querying for game details with PIN: ${gamePin}`);
+  const { data: game, error: dbError } = await supabase
     .from('games')
-    .select('id, game_pin, status, host_id, current_question_index')
+    .select('id, game_pin, status, host_id') // Select necessary fields
     .eq('game_pin', gamePin)
     .single();
 
-  if (gameError || !game) {
-    console.error(`[play.$gameId.tsx loader] Error fetching game ${gamePin} or game not found:`, gameError);
-    throw new Response('Game not found.', { status: 404 });
+  if (dbError || !game) {
+    console.warn(`[play.$gameId.tsx loader] Game PIN ${gamePin} not found or error:`, dbError);
+     // Log the specific error before throwing
+     const errorMessage = dbError ? `Database error: ${dbError.message}` : 'Invalid Game PIN.';
+     console.error(`[play.$gameId.tsx loader] Throwing 404/500: ${errorMessage}`);
+     throw json({ error: errorMessage }, { status: dbError ? 500 : 404 });
   }
 
-  // Fetch current players (RLS handles permissions)
-  const { data: initialPlayers, error: playersError } = await supabase
-    .from('players')
-    .select('id, nickname, score')
-    .eq('game_id', game.id); // Use game UUID
-
-   if (playersError) {
-     console.error('[play.$gameId.tsx loader] Error fetching initial players:', playersError);
+   if (game.status !== 'lobby') {
+     console.warn(`[play.$gameId.tsx loader] Attempt to load join page for game ${gamePin} which is not in lobby (status: ${game.status})`);
+     throw json({ error: `Game is already ${game.status}. Cannot join now.` }, { status: 403 });
    }
 
-   // TODO: Fetch current question if game is active
-
-  console.log(`[play.$gameId.tsx loader] Successfully loaded data for game ${gamePin}`);
-  return json({
-      game: { id: game.id, game_pin: game.game_pin, status: game.status, current_question_index: game.current_question_index },
-      initialPlayers: initialPlayers ?? [],
-      playerUserId: playerUser.id
-  });
+  console.log(`[play.$gameId.tsx loader] Player ${playerUser.email} can join game ${gamePin}. Rendering join form.`);
+  // Return game data and player info for the form page
+  return json({ game, playerUser, alreadyJoined: false }); // Assuming alreadyJoined logic is handled elsewhere or removed for simplicity
 }
 
+// Action: Handle the form submission to join the game
 export async function action({ request, params }: ActionFunctionArgs) {
-    console.log(`\n--- [play.$gameId.tsx action] --- Handling POST request`);
-    const playerUser = await requirePlayer(request);
-    const gamePin = params.gameId?.toUpperCase(); // Get PIN from route segment
-    const formData = await request.formData();
-    const nickname = formData.get('nickname') as string;
+  const playerUser = await requirePlayer(request); // Ensure user is logged in and is a player
+  const gamePin = params.gameId?.toUpperCase();
+  const formData = await request.formData();
+  const nickname = formData.get('nickname')?.toString().trim();
 
-    console.log(`[play.$gameId.tsx action] gamePin from params: ${gamePin}, nickname from form: ${nickname}`);
+  console.log(`\n--- [play.$gameId.tsx action] --- Handling join attempt for game PIN: ${gamePin} by user: ${playerUser.email}`);
 
-    if (!gamePin) {
-        console.error("[play.$gameId.tsx action] No gameId found in route parameters!");
-        return json({ error: 'Game PIN missing in route parameters.' }, { status: 400 });
+  if (!gamePin) {
+    console.error("[play.$gameId.tsx action] No gamePin found in route params.");
+    return json({ error: 'Game PIN missing in URL.' }, { status: 400 });
+  }
+
+  if (!nickname || nickname.length === 0 || nickname.length > 20) {
+    console.warn(`[play.$gameId.tsx action] Invalid nickname provided: "${nickname}"`);
+    return json({ error: 'Nickname must be between 1 and 20 characters.' }, { status: 400 });
+  }
+
+  let supabase;
+  try {
+    console.log("[play.$gameId.tsx action] Attempting to create server client...");
+    supabase = createServerClient(request); // Use authenticated server client
+     console.log("[play.$gameId.tsx action] Server client created. Type:", typeof supabase);
+     if (!supabase || typeof supabase.from !== 'function') {
+         console.error("[play.$gameId.tsx action] Failed to create a valid Supabase client or client is malformed.");
+         throw new Error("Failed to initialize database connection for action.");
+     }
+     console.log("[play.$gameId.tsx action] Supabase client seems valid. Proceeding...");
+  } catch (error) {
+      console.error("[play.$gameId.tsx action] Error creating Supabase client:", error);
+      // Return JSON error response instead of throwing
+      return json({ error: "Internal server error initializing database connection." }, { status: 500 });
+  }
+
+
+  // *** Re-fetch game state within the action to prevent race conditions ***
+  console.log(`[play.$gameId.tsx action] Checking game status for PIN: ${gamePin}`);
+  const { data: game, error: gameCheckError } = await supabase
+    .from('games')
+    .select('id, status, host_id') // Select needed fields
+    .eq('game_pin', gamePin)
+    .single();
+
+  if (gameCheckError || !game) {
+    console.warn(`[play.$gameId.tsx action] Game PIN ${gamePin} not found or error during action check:`, gameCheckError);
+    return json({ error: 'Game not found or could not be verified.' }, { status: 404 });
+  }
+
+  // *** Check game status AGAIN before insert ***
+  if (game.status !== 'lobby') {
+    console.warn(`[play.$gameId.tsx action] Attempt to join game ${gamePin} which is no longer in lobby (status: ${game.status})`);
+    return json({ error: `Game is no longer accepting players (status: ${game.status}).` }, { status: 403 });
+  }
+
+  if (game.host_id === playerUser.id) {
+      console.warn(`[play.$gameId.tsx action] Host (${playerUser.email}) attempted to join their own game ${gamePin} as a player.`);
+      return json({ error: 'Hosts cannot join their own game as a player.' }, { status: 403 });
+  }
+
+   console.log(`[play.$gameId.tsx action] Checking nickname uniqueness: "${nickname}" in game ID: ${game.id}`);
+   const { data: existingNickname, error: nicknameCheckError } = await supabase
+     .from('players')
+     .select('nickname')
+     .eq('game_id', game.id)
+     .eq('nickname', nickname)
+     .maybeSingle();
+
+   if (nicknameCheckError) {
+     // *** ENHANCED LOGGING ***
+     console.error(`[play.$gameId.tsx action] Error checking nickname uniqueness for game ${gamePin}. Nickname: "${nickname}", GameID: ${game.id}`);
+     console.error('[play.$gameId.tsx action] Full Nickname Check Error:', JSON.stringify(nicknameCheckError, null, 2)); // Log the full error object
+     // *** END ENHANCED LOGGING ***
+     return json({ error: 'Database error checking nickname.' }, { status: 500 });
+   }
+
+   if (existingNickname) {
+     console.warn(`[play.$gameId.tsx action] Nickname "${nickname}" already taken in game ${gamePin}.`);
+     return json({ error: `Nickname "${nickname}" is already taken in this game.` }, { status: 409 }); // 409 Conflict
+   }
+
+  // *** Attempt to insert the player AND return the ID ***
+  console.log(`[play.$gameId.tsx action] Inserting player "${nickname}" (User ID: ${playerUser.id}) into game ID: ${game.id}`);
+  const { data: newPlayer, error: insertError } = await supabase
+    .from('players')
+    .insert({
+      game_id: game.id, // Use the validated game ID
+      nickname: nickname,
+      user_id: playerUser.id // Link player to the authenticated user
+    })
+    .select('id') // Select the ID of the newly inserted row
+    .single(); // Expect only one row back
+
+  if (insertError) {
+    console.error(`[play.$gameId.tsx action] Error inserting player ${nickname} into game ${gamePin} (ID: ${game.id}):`, insertError);
+    // Check if the error is specifically RLS violation (code 42501)
+    if (insertError.code === '42501') {
+       console.error("[play.$gameId.tsx action] RLS policy violation confirmed during insert.");
+       return json({ error: 'Failed to join the game. Please ensure the game is still in the lobby and accepting players. (RLS)' }, { status: 403 });
     }
-    if (!nickname || nickname.trim().length === 0 || nickname.length > 20) {
-        console.error("[play.$gameId.tsx action] Invalid nickname:", nickname);
-        return json({ error: 'Nickname must be between 1 and 20 characters.' }, { status: 400 });
-    }
+    // Handle other potential DB errors
+    console.error('[play.$gameId.tsx action] Full Insert Error:', JSON.stringify(insertError, null, 2)); // Log full insert error too
+    return json({ error: `Failed to join the game. Database error: ${insertError.message}` }, { status: 500 });
+  }
 
-    const { data: game, error: gameError } = await supabase
-      .from('games').select('id, status').eq('game_pin', gamePin).single();
+  if (!newPlayer || !newPlayer.id) {
+      console.error(`[play.$gameId.tsx action] Player insert succeeded but no ID returned for ${nickname} in game ${gamePin}.`);
+      return json({ error: 'Failed to join the game. Could not retrieve player ID after creation.' }, { status: 500 });
+  }
 
-    if (gameError || !game) {
-        console.error("[play.$gameId.tsx action] Game not found:", gamePin, gameError);
-        return json({ error: 'Game not found.' }, { status: 404 });
-    }
-    if (game.status !== 'lobby') {
-        console.warn(`[play.$gameId.tsx action] Attempt to join non-lobby game ${gamePin} (status: ${game.status})`);
-        return json({ error: 'Game is no longer accepting players.' }, { status: 403 });
-    }
+  console.log(`[play.$gameId.tsx action] Player ${nickname} (ID: ${newPlayer.id}, UserID: ${playerUser.id}) successfully joined game ${gamePin} (ID: ${game.id}).`);
 
-    // TODO: Add check here to prevent user joining multiple games if user_id is added to players table
-
-    const { data: newPlayer, error: insertError } = await supabase
-        .from('players')
-        .insert({ game_id: game.id, nickname: nickname.trim() /*, user_id: playerUser.id */ })
-        .select() // Select the newly created player record
-        .single();
-
-    if (insertError) {
-        console.error('[play.$gameId.tsx action] Error inserting player:', insertError);
-        if (insertError.code === '23505') { // Unique violation
-             return json({ error: 'This nickname is already taken in this game.' }, { status: 409 });
-        }
-        return json({ error: 'Failed to join the game. ' + insertError.message }, { status: 500 });
-    }
-
-    console.log(`[play.$gameId.tsx action] Player ${nickname} joined game ${gamePin} (DB record created)`);
-    return json({ success: true, player: newPlayer });
+  // Return success, the nickname, and the NEWLY CREATED PLAYER ID
+  return json({ success: true, joinedNickname: nickname, playerId: newPlayer.id });
 }
 
 
-// --- Component code remains the same ---
-export default function PlayGame() {
-  const { game, initialPlayers, playerUserId } = useLoaderData<typeof loader>();
-  const joinFetcher = useFetcher<JoinActionData>(); // Use refined type
-  const [players, setPlayers] = useState<PlayerInfo[]>(initialPlayers);
-  const [sharedState, setSharedState] = useState<number>(0);
-  const [gameStatus, setGameStatus] = useState<'lobby' | 'active' | 'finished' | 'ended'>(game.status as any);
-  const [currentQuestion, setCurrentQuestion] = useState<any>(null); // Store current question object
-  const [wsConnected, setWsConnected] = useState(false);
-  const [hasJoined, setHasJoined] = useState(false); // Track if join action was successful
-  const [joinedPlayerInfo, setJoinedPlayerInfo] = useState<{id: string; nickname: string} | null>(null);
+// Component: Form for joining a game OR Lobby view
+export default function JoinGamePage() {
+  const { game, playerUser } = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+  const isSubmitting = navigation.state === 'submitting';
 
+  // State for WebSocket connection, player list, and shared state
+  const [players, setPlayers] = useState<PlayerInfo[]>([]);
+  const [sharedState, setSharedState] = useState<number>(0); // Initial shared state for player view
+  const [isConnected, setIsConnected] = useState(false);
+  const [hasJoined, setHasJoined] = useState(actionData?.success ?? false);
+  const [joinedNickname, setJoinedNickname] = useState(actionData?.joinedNickname ?? '');
+  const [playerId, setPlayerId] = useState(actionData?.playerId ?? ''); // Store player ID
   const ws = useRef<WebSocket | null>(null);
-  const gameId = game.id; // Game UUID
 
-  const isJoining = joinFetcher.state !== 'idle';
-  const joinError = joinFetcher.data && 'error' in joinFetcher.data ? joinFetcher.data.error : null;
-  const joinSuccessData = joinFetcher.data && 'success' in joinFetcher.data ? joinFetcher.data : null;
+  const gameId = game.id; // The actual UUID game ID
+  const gamePin = game.game_pin; // The user-facing PIN
 
-  // Effect to handle successful join and store player info
+  // Update state if actionData changes (e.g., after form submission)
   useEffect(() => {
-      if (joinSuccessData?.success && joinSuccessData.player) {
-          setHasJoined(true);
-          setJoinedPlayerInfo({ id: joinSuccessData.player.id, nickname: joinSuccessData.player.nickname });
-          console.log("[PlayGame Effect] Join successful, player info stored:", joinSuccessData.player);
-      }
-  }, [joinSuccessData]);
-
-
-  // Effect for WebSocket connection *after* successful join
-  useEffect(() => {
-    if (!hasJoined || !joinedPlayerInfo || ws.current) {
-        // console.log("[PlayGame WS Effect] Skipping connection (hasJoined:", hasJoined, "joinedPlayerInfo:", !!joinedPlayerInfo, "ws.current:", !!ws.current, ")");
-        return;
+    if (actionData?.success) {
+      setHasJoined(true);
+      setJoinedNickname(actionData.joinedNickname);
+      setPlayerId(actionData.playerId); // Store the player ID
     }
+  }, [actionData]);
 
-    const wsUrl = `ws://${window.location.host}/ws`;
-    ws.current = new WebSocket(wsUrl);
-    console.log(`[PlayGame WS Effect] Attempting Player WebSocket connection to ${wsUrl}`);
+  // Effect to establish WebSocket connection after joining
+  useEffect(() => {
+    // Only connect if the player has successfully joined (either via action or if they were already joined)
+    if (hasJoined && playerId && gameId) {
+      console.log(`Player ${joinedNickname} (ID: ${playerId}) attempting WebSocket connection for game ${gameId}...`);
 
-    ws.current.onopen = () => {
-      console.log('[PlayGame WS Effect] Player WebSocket connected');
-      setWsConnected(true);
-      ws.current?.send(JSON.stringify({
-          type: 'PLAYER_IDENTIFY',
-          payload: {
-              gameId: gameId,
-              playerId: joinedPlayerInfo.id,
-              nickname: joinedPlayerInfo.nickname
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${window.location.host}/ws`; // Connect to the base WS endpoint
+      console.log(`Connecting to WebSocket: ${wsUrl}`);
+
+      ws.current = new WebSocket(wsUrl);
+
+      ws.current.onopen = () => {
+        console.log(`WebSocket connected for player ${joinedNickname} in game ${gameId}`);
+        setIsConnected(true);
+        // Send PLAYER_IDENTIFY message with gameId (UUID), playerId (UUID), and nickname
+        ws.current?.send(JSON.stringify({
+            type: 'PLAYER_IDENTIFY',
+            payload: {
+                gameId: gameId,
+                playerId: playerId,
+                nickname: joinedNickname
+            }
+        }));
+      };
+
+      ws.current.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          console.log(`Player ${joinedNickname} received message:`, message);
+
+          switch (message.type) {
+            case 'PLAYER_LIST_UPDATE':
+              setPlayers(message.payload.players);
+              break;
+            case 'SHARED_STATE_UPDATE':
+              setSharedState(message.payload.newState);
+              break;
+            case 'IDENTIFY_SUCCESS':
+              console.log('Server confirmed WebSocket identification.');
+              break;
+            case 'GAME_ENDED':
+              console.log('Game ended by host.');
+              alert(`Game Over: ${message.payload || 'The host ended the game.'}`);
+              // TODO: Redirect or update UI to reflect game end
+              setHasJoined(false); // Go back to join form state maybe?
+              ws.current?.close();
+              break;
+            // Handle other game messages (e.g., SHOW_QUESTION)
+            default:
+              console.log(`Player received unhandled message type: ${message.type}`);
           }
-      }));
-      console.log('[PlayGame WS Effect] Sent PLAYER_IDENTIFY');
-    };
-
-    ws.current.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
-        console.log('[PlayGame WS Effect] Player received message:', message.type);
-
-        switch (message.type) {
-          case 'PLAYER_LIST_UPDATE':
-            setPlayers(message.payload.players);
-            break;
-          case 'SHARED_STATE_UPDATE':
-            setSharedState(message.payload.newState);
-            break;
-          case 'GAME_STARTED':
-            setGameStatus('active');
-            setCurrentQuestion(null);
-            console.log("[PlayGame WS Effect] Game started!");
-            break;
-          case 'SHOW_QUESTION':
-             setGameStatus('active');
-             setCurrentQuestion(message.payload);
-             console.log("[PlayGame WS Effect] Received question:", message.payload.index);
-             break;
-          case 'GAME_ENDED':
-            setGameStatus('ended');
-            setCurrentQuestion(null);
-            console.log("[PlayGame WS Effect] Game ended:", message.payload);
-            ws.current?.close(1000, "Game Ended by Host");
-            break;
-          default:
-            console.log('[PlayGame WS Effect] Player received unhandled message type:', message.type);
+        } catch (error) {
+          console.error('Error parsing WebSocket message:', error);
         }
-      } catch (error) {
-        console.error('[PlayGame WS Effect] Error parsing message or handling update:', error);
-      }
-    };
+      };
 
-    ws.current.onerror = (error) => {
-      console.error('[PlayGame WS Effect] Player WebSocket error:', error);
-      setWsConnected(false);
-    };
+      ws.current.onerror = (error) => {
+        console.error(`WebSocket error for player ${joinedNickname}:`, error);
+        setIsConnected(false);
+      };
 
-    ws.current.onclose = (event) => {
-      console.log('[PlayGame WS Effect] Player WebSocket disconnected:', event.code, event.reason);
-      setWsConnected(false);
-      // Optionally handle unexpected disconnects
-    };
+      ws.current.onclose = (event) => {
+        console.log(`WebSocket disconnected for player ${joinedNickname}. Code: ${event.code}, Reason: ${event.reason}`);
+        setIsConnected(false);
+        // Optionally attempt reconnect or show disconnected state
+      };
 
-    return () => {
-      if (ws.current) {
-          console.log('[PlayGame WS Effect] Closing player WebSocket connection');
+      // Cleanup function
+      return () => {
+        if (ws.current) {
+          console.log(`Closing WebSocket connection for player ${joinedNickname}`);
           ws.current.close();
           ws.current = null;
-          setWsConnected(false);
-      }
-    };
-  }, [hasJoined, gameId, joinedPlayerInfo]);
-
-
-  // Function to send message (e.g., submit answer)
-  const sendMessage = useCallback((message: any) => {
-    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      ws.current.send(JSON.stringify(message));
-    } else {
-      console.error('[PlayGame sendMessage] WebSocket not connected or not open.');
+        }
+      };
     }
-  }, []);
-
-  // Handler for submitting an answer
-  const submitAnswer = (answerIndex: number) => {
-      if (gameStatus !== 'active' || !currentQuestion) return;
-      sendMessage({
-          type: 'SUBMIT_ANSWER',
-          payload: { answerIndex }
-      });
-      console.log(`[PlayGame submitAnswer] Submitting answer: ${answerIndex}`);
-      // TODO: Add visual feedback
-  };
+  }, [hasJoined, gameId, playerId, joinedNickname]); // Dependencies for establishing connection
 
 
+  // --- Render Logic ---
+
+  if (hasJoined) {
+    // Display Lobby/Waiting screen
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 p-8">
+        <h1 className="text-3xl font-bold text-gray-800 dark:text-gray-100">
+          Game Lobby: {gamePin}
+        </h1>
+        <p className="text-lg text-gray-600 dark:text-gray-300">
+          Welcome, {joinedNickname}! Waiting for the host to start...
+        </p>
+        <p className={`text-sm font-semibold ${isConnected ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+          {isConnected ? 'Connected' : 'Disconnected'}
+        </p>
+
+        {/* Display Shared State */}
+        <div className="my-4 p-3 border rounded dark:border-gray-600 bg-gray-100 dark:bg-gray-800">
+            <h2 className="text-lg font-semibold mb-2 text-center">Shared Counter</h2>
+            <p className="text-3xl font-bold text-center">{sharedState}</p>
+        </div>
+
+
+        <div className="mt-4 w-full max-w-sm p-4 border rounded bg-gray-50 dark:bg-gray-700">
+          <h2 className="text-xl font-semibold mb-2 text-center">Players Joined ({players.length}):</h2>
+          {players.length > 0 ? (
+            <ul className="list-disc list-inside space-y-1">
+              {players.map((player) => (
+                <li key={player.id} className="text-gray-700 dark:text-gray-200">
+                    {player.nickname} {player.id === playerId ? '(You)' : ''}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-center text-gray-500 dark:text-gray-400">Waiting for players...</p>
+          )}
+        </div>
+         <Link to="/" className="mt-6 text-blue-600 hover:underline dark:text-blue-400">
+            Leave Game
+         </Link>
+      </div>
+    );
+  }
+
+  // Display Join Form
   return (
-    <div className="p-6">
-      <h1 className="text-3xl font-bold mb-4">Playing Game: {game.game_pin}</h1>
-      <p className="mb-1">Status: <span className="font-semibold">{gameStatus}</span> {wsConnected ? '(Connected)' : '(Connecting/Disconnected)'}</p>
-      {hasJoined && joinedPlayerInfo && <p className="mb-6">Playing as: <span className="font-semibold">{joinedPlayerInfo.nickname}</span></p>}
+    <div className="flex flex-col items-center justify-center gap-6 p-8">
+      <h1 className="text-3xl font-bold text-gray-800 dark:text-gray-100">
+        Join Game: <span className="font-mono tracking-widest">{gamePin}</span>
+      </h1>
+      <p className="text-gray-600 dark:text-gray-400">Enter a nickname to join the game.</p>
 
-
-      {/* Nickname Form */}
-      {gameStatus === 'lobby' && !hasJoined && (
-        <joinFetcher.Form method="post" className="max-w-sm mb-6 p-4 border rounded dark:border-gray-700">
-          <h2 className="text-xl font-semibold mb-3">Choose your nickname</h2>
-          <label htmlFor="nickname" className="block text-sm font-medium mb-1 dark:text-gray-300">
-            Nickname (1-20 characters)
+      <Form method="post" className="w-full max-w-xs space-y-4">
+        <div>
+          <label htmlFor="nickname" className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+            Nickname
           </label>
           <input
             type="text"
             id="nickname"
             name="nickname"
             required
+            minLength={1}
             maxLength={20}
-            className="w-full rounded border border-gray-300 px-3 py-2 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-700 dark:border-gray-600 dark:text-white dark:focus:ring-offset-gray-800"
+            aria-describedby="nickname-error"
           />
-          {joinError && (
-            <p className="mt-2 text-sm text-red-600 dark:text-red-400">{joinError}</p>
-          )}
-          <button
-            type="submit"
-            disabled={isJoining}
-            className="mt-3 w-full rounded bg-green-600 px-4 py-2 text-white hover:bg-green-700 disabled:opacity-50"
-          >
-            {isJoining ? 'Joining...' : 'Join Game'}
-          </button>
-        </joinFetcher.Form>
-      )}
-
-      {/* Shared State Display */}
-       {hasJoined && (
-           <div className="my-4 p-3 border rounded dark:border-gray-600 bg-gray-50 dark:bg-gray-800">
-               <h3 className="text-lg font-semibold text-center">Admin's Shared Number:</h3>
-               <p className="text-5xl font-bold text-center text-purple-600 dark:text-purple-400">{sharedState}</p>
-           </div>
-       )}
-
-
-      {/* Waiting Room / Game Active UI */}
-      {hasJoined && (
-        <div>
-          {gameStatus === 'lobby' && (
-            <p className="text-lg text-blue-700 dark:text-blue-300">Waiting for the host to start the game...</p>
-          )}
-          {gameStatus === 'active' && currentQuestion && (
-            <div>
-              <h2 className="text-2xl font-semibold mb-4">Question {currentQuestion.index + 1}</h2>
-              <p className="text-xl mb-4">{currentQuestion.text}</p>
-              <div className="grid grid-cols-2 gap-4 mt-4">
-                 {currentQuestion.options.map((option: string, index: number) => (
-                     <button
-                        key={index}
-                        onClick={() => submitAnswer(index)}
-                        className={`text-white font-bold py-4 px-4 rounded ${
-                            index === 0 ? 'bg-red-500 hover:bg-red-600' :
-                            index === 1 ? 'bg-blue-500 hover:bg-blue-600' :
-                            index === 2 ? 'bg-yellow-500 hover:bg-yellow-600' :
-                            'bg-green-500 hover:bg-green-600' // index === 3
-                        }`}
-                     >
-                         {option}
-                     </button>
-                 ))}
-              </div>
-            </div>
-          )}
-           {gameStatus === 'active' && !currentQuestion && (
-               <p className="text-lg text-gray-600 dark:text-gray-400">Waiting for the next question...</p>
-           )}
-           {gameStatus === 'finished' && (
-             <p className="text-lg font-semibold text-purple-700 dark:text-purple-300">The game has finished!</p>
-             // TODO: Show final scores/leaderboard
-           )}
-           {gameStatus === 'ended' && (
-               <p className="text-lg font-semibold text-red-700 dark:text-red-400">The game has ended because the host left.</p>
-           )}
         </div>
-      )}
 
-      {/* Player List */}
-      {hasJoined && (
-          <>
-              <h3 className="text-xl font-semibold mt-8 mb-3">Players in Game ({players.length})</h3>
-              {players.length > 0 ? (
-                <ul className="list-inside list-disc space-y-1">
-                  {players.map((player) => (
-                    <li key={player.id}>
-                      {player.nickname}
-                      {player.id === joinedPlayerInfo?.id ? ' (You)' : ''}
-                      {/* (Score: {player.score}) */}
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                 <p>Waiting for players...</p>
-              )}
-          </>
-      )}
+        {actionData?.error && !actionData?.success && ( // Only show error if not successful
+          <p id="nickname-error" className="text-sm text-red-600 dark:text-red-400">
+            {actionData.error}
+          </p>
+        )}
+
+        <button
+          type="submit"
+          disabled={isSubmitting}
+          className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:opacity-50 dark:focus:ring-offset-gray-800"
+        >
+          {isSubmitting ? 'Joining...' : 'Join Game'}
+        </button>
+      </Form>
+       <Link to="/" className="mt-4 text-blue-600 hover:underline dark:text-blue-400">
+         Cancel
+       </Link>
     </div>
   );
 }

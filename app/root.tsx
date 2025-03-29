@@ -28,20 +28,115 @@ export const links: LinksFunction = () => [
 
 // Loader to get user data for the root layout
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await getUser(request);
-  // Pass Supabase env vars needed for client-side Supabase initialization
-  return json({
-    user,
-    ENV: {
-      VITE_SUPABASE_URL: process.env.VITE_SUPABASE_URL,
-      VITE_SUPABASE_ANON_KEY: process.env.VITE_SUPABASE_ANON_KEY,
-    },
-  });
+  console.log("--- [root.tsx loader] --- Start");
+  let user = null; // Initialize user
+  try {
+    console.log("[root.tsx loader] Attempting to fetch user...");
+    user = await getUser(request);
+    console.log("[root.tsx loader] User fetched:", user ? { id: user.id, email: user.email, metadata: user.user_metadata } : 'null');
+
+    // --- NEW: Check if process.env exists ---
+    console.log("[root.tsx loader] Checking if process.env exists...");
+    if (typeof process === 'undefined' || typeof process.env === 'undefined') {
+        console.error("[root.tsx loader] CRITICAL ERROR: process or process.env is undefined!");
+        throw new Error("Server environment configuration error: process.env is undefined.");
+    }
+    console.log("[root.tsx loader] process.env seems to exist. Type:", typeof process.env);
+    // --- End Check ---
+
+    console.log("[root.tsx loader] Accessing environment variables..."); // Renamed log slightly
+    const supabaseUrl = process.env.VITE_SUPABASE_URL;
+    const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY;
+    console.log("[root.tsx loader] Accessed env vars (values hidden for security)."); // Log after access attempt
+
+    if (!supabaseUrl || !supabaseAnonKey) {
+      console.error("[root.tsx loader] ERROR: Supabase env vars missing server-side!");
+      // Log which specific var is missing if possible
+      if (!supabaseUrl) console.error("[root.tsx loader] VITE_SUPABASE_URL is missing or empty.");
+      if (!supabaseAnonKey) console.error("[root.tsx loader] VITE_SUPABASE_ANON_KEY is missing or empty.");
+      throw new Error("Server configuration error: Supabase environment variables are missing.");
+    }
+     console.log("[root.tsx loader] Supabase env vars validated."); // Renamed log
+
+    const responseData = {
+      user,
+      ENV: {
+        VITE_SUPABASE_URL: supabaseUrl,
+        VITE_SUPABASE_ANON_KEY: supabaseAnonKey,
+      },
+    };
+
+    console.log("[root.tsx loader] Preparing JSON response data:", {
+        userId: responseData.user?.id,
+        userEmail: responseData.user?.email,
+        envKeys: Object.keys(responseData.ENV)
+    });
+
+    try {
+        const jsonResponse = json(responseData);
+        console.log("--- [root.tsx loader] --- End Success (JSON serialization successful)");
+        return jsonResponse;
+    } catch (serializationError) {
+        console.error("--- [root.tsx loader] --- ERROR during JSON serialization:", serializationError);
+        console.error("[root.tsx loader] Data structure causing serialization error:", JSON.stringify(responseData, null, 2));
+        return json({ error: "Failed to serialize root data." }, { status: 500 });
+    }
+
+  } catch (error) {
+    console.error("--- [root.tsx loader] --- ERROR (Outer Catch):", error);
+     return json({ error: `Failed to load root data: ${error instanceof Error ? error.message : String(error)}` }, { status: 500 });
+  }
 }
 
+// Combine Layout logic directly into the default export App component
+export default function App() {
+  const loaderData = useLoaderData<typeof loader>();
 
-export function Layout({ children }: { children: React.ReactNode }) {
-  const { user, ENV } = useLoaderData<typeof loader>();
+   // Handle potential error state from the loader
+  if (loaderData && 'error' in loaderData) {
+    return (
+      <html lang="en" className="h-full">
+        <head>
+          <title>Error</title>
+          <Meta />
+          <Links />
+        </head>
+        <body className="h-full flex items-center justify-center bg-red-100">
+          <div className="text-center p-8 bg-white shadow-md rounded">
+            <h1 className="text-2xl font-bold text-red-700">Application Error</h1>
+            <p className="text-red-600 mt-2">{loaderData.error}</p>
+            <p className="mt-4 text-sm text-gray-600">Please check the server logs for more details.</p>
+          </div>
+          <Scripts />
+        </body>
+      </html>
+    );
+  }
+
+  // Handle case where loaderData might be unexpectedly null/undefined
+   if (!loaderData) {
+     return (
+       <html lang="en" className="h-full">
+         <head>
+           <title>Loading Error</title>
+           <Meta />
+           <Links />
+         </head>
+         <body className="h-full flex items-center justify-center bg-yellow-100">
+           <div className="text-center p-8 bg-white shadow-md rounded">
+             <h1 className="text-2xl font-bold text-yellow-700">Loading Error</h1>
+             <p className="text-yellow-600 mt-2">Failed to load application data. Please try refreshing.</p>
+           </div>
+           <Scripts />
+         </body>
+       </html>
+     );
+   }
+
+
+  // Destructure safely now that we know 'error' isn't present and loaderData exists
+  const { user, ENV } = loaderData;
+
 
   return (
     <html lang="en" className="h-full">
@@ -81,7 +176,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         </header>
 
         <main className="container mx-auto p-4">
-           {children}
+           <Outlet /> {/* Render the matched child route component here */}
         </main>
 
         {/* Pass env vars to the client */}
@@ -97,12 +192,3 @@ export function Layout({ children }: { children: React.ReactNode }) {
     </html>
   );
 }
-
-export default function App() {
-  return <Outlet />;
-}
-
-// Add a client-side listener for Supabase auth changes
-// This keeps the client session in sync if it changes in another tab, etc.
-// Needs to be placed in a component rendered on the client, like entry.client.tsx or here if careful
-// For simplicity, let's add it to entry.client.tsx later if needed.

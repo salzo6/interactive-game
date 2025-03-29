@@ -1,8 +1,8 @@
 import type { LoaderFunctionArgs, MetaFunction } from '@remix-run/node';
 import { json, redirect } from '@remix-run/node';
 import { Link, useLoaderData } from '@remix-run/react';
-import { supabase } from '~/lib/supabase';
-import { requirePlayer } from '~/lib/session.server';
+// import { supabase } from '~/lib/supabase'; // REMOVE: Don't use browser client in loader
+import { requirePlayer, createServerClient } from '~/lib/session.server'; // Import server client creator
 
 export const meta: MetaFunction = () => {
   return [{ title: 'Join Game - Live Quiz' }];
@@ -11,25 +11,21 @@ export const meta: MetaFunction = () => {
 // Loader: Validate game PIN from query param and redirect
 export async function loader({ request }: LoaderFunctionArgs) {
   const url = new URL(request.url);
-  // Log entry point for this specific loader
   console.log(`\n--- [play._index.tsx loader] --- Handling request for path: ${url.pathname}, search: ${url.search}`);
-
-  // This loader should ONLY handle requests like /play?gameId=...
-  // It should NOT handle /play/SOME_PIN
 
   const playerUser = await requirePlayer(request);
   const gamePin = url.searchParams.get('gameId')?.toUpperCase();
+  const supabase = createServerClient(request); // USE server client
 
   console.log(`[play._index.tsx loader] Extracted gamePin from searchParams: ${gamePin}`);
 
   if (!gamePin) {
     console.error("[play._index.tsx loader] No gamePin found in URL search params.");
-    // If no gamePin, maybe render a page asking for one, or redirect home?
-    // For now, return an error.
     return json({ error: 'No Game PIN provided in the URL (?gameId=...).' }, { status: 400 });
   }
 
-  const { data: game, error: dbError } = await supabase
+  console.log(`[play._index.tsx loader] Querying for game with PIN: ${gamePin} using server client...`);
+  const { data: game, error: dbError } = await supabase // Use the server client instance
     .from('games')
     .select('id, status')
     .eq('game_pin', gamePin)
@@ -37,7 +33,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   if (dbError || !game) {
     console.warn(`[play._index.tsx loader] Game PIN ${gamePin} not found or error:`, dbError);
-    return json({ error: 'Invalid Game PIN.' }, { status: 404 });
+    // Return specific error message based on whether it was a DB error or just not found
+    const errorMessage = dbError ? `Database error checking PIN: ${dbError.message}` : 'Invalid Game PIN.';
+    return json({ error: errorMessage }, { status: 404 });
   }
 
   if (game.status !== 'lobby') {
